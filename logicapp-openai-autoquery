@@ -1,0 +1,306 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "Microsoft_Sentinel_incident": {
+                "type": "ApiConnectionWebhook",
+                "inputs": {
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                        }
+                    },
+                    "body": {
+                        "callback_url": "@listCallbackUrl()"
+                    },
+                    "path": "/incident-creation"
+                }
+            }
+        },
+        "actions": {
+            "Initialize_EnrichmentQueries": {
+                "runAfter": {},
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "EnrichmentQueries",
+                            "type": "Array",
+                            "value": []
+                        }
+                    ]
+                }
+            },
+            "Initialize_EnrichmentResults": {
+                "runAfter": {
+                    "Initialize_EnrichmentQueries": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "EnrichmentResults",
+                            "type": "Array",
+                            "value": []
+                        }
+                    ]
+                }
+            },
+            "List_LogAnalytics_Tables": {
+                "runAfter": {
+                    "Initialize_EnrichmentResults": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://api.loganalytics.io/v1/workspaces/@{parameters('workspaceId')}/metadata/tables",
+                    "method": "GET",
+                    "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://api.loganalytics.io/"
+                    }
+                }
+            },
+            "Compose_Query_Generation_Prompt": {
+                "runAfter": {
+                    "List_LogAnalytics_Tables": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Compose",
+                "inputs": {
+                    "content": "@concat(\n  'Incident ', triggerBody()?['data']['name'], '\n',\n  'Severity: ', triggerBody()?['data']['properties']['severity'], '\n\n',\n  'Available Tables:\\n', body('List_LogAnalytics_Tables')\n)"
+                }
+            },
+            "Generate_Enrichment_Queries": {
+                "runAfter": {
+                    "Compose_Query_Generation_Prompt": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://api.openai.com/v1/chat/completions",
+                    "method": "POST",
+                    "headers": {
+                        "Authorization": "Bearer @{parameters('openAiApiKey')}",
+                        "Content-Type": "application/json"
+                    },
+                    "body": {
+                        "model": "gpt-4o-mini",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a security enrichment engineer. Given an incident and available Log Analytics tables, select up to five tables and generate a KQL query per table. Return a JSON array of {\"table\":...,\"query\":...}."
+                            },
+                            {
+                                "role": "user",
+                                "content": "@outputs('Compose_Query_Generation_Prompt')"
+                            }
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 512
+                    }
+                }
+            },
+            "Parse_Enrichment_Queries": {
+                "runAfter": {
+                    "Generate_Enrichment_Queries": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "ParseJson",
+                "inputs": {
+                    "content": "@body('Generate_Enrichment_Queries')['choices'][0]['message']['content']",
+                    "schema": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "table": {
+                                    "type": "string"
+                                },
+                                "query": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "For_each_EnrichmentQuery": {
+                "foreach": "@body('Parse_Enrichment_Queries')",
+                "actions": {
+                    "Run_Enrichment_Query": {
+                        "type": "Http",
+                        "inputs": {
+                            "uri": "https://api.loganalytics.io/v1/workspaces/@{parameters('workspaceId')}/query?api-version=2020-08-01",
+                            "method": "POST",
+                            "headers": {
+                                "Content-Type": "application/json"
+                            },
+                            "body": {
+                                "query": "@item()?['query']"
+                            },
+                            "authentication": {
+                                "type": "ManagedServiceIdentity",
+                                "audience": "https://api.loganalytics.io/"
+                            }
+                        }
+                    },
+                    "Append_to_Results": {
+                        "runAfter": {
+                            "Run_Enrichment_Query": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "AppendToArrayVariable",
+                        "inputs": {
+                            "name": "EnrichmentResults",
+                            "value": {
+                                "table": "@item()?['table']",
+                                "results": "@body('Run_Enrichment_Query')['tables'][0]['rows']"
+                            }
+                        }
+                    }
+                },
+                "runAfter": {
+                    "Parse_Enrichment_Queries": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Foreach"
+            },
+            "Compose_Final_Prompt": {
+                "runAfter": {
+                    "For_each_EnrichmentQuery": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Compose",
+                "inputs": {
+                    "content": "@concat(\n  'Incident ', triggerBody()?['data']['name'], '\n',\n  'Severity: ', triggerBody()?['data']['properties']['severity'], '\n\n',\n  'Enrichment Results:\\n', json(string(variables('EnrichmentResults')))\n)"
+                }
+            },
+            "Call_OpenAI_for_Analysis": {
+                "runAfter": {
+                    "Compose_Final_Prompt": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://api.openai.com/v1/chat/completions",
+                    "method": "POST",
+                    "headers": {
+                        "Authorization": "Bearer @{parameters('openAiApiKey')}",
+                        "Content-Type": "application/json"
+                    },
+                    "body": {
+                        "model": "gpt-4o-mini",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a security triage assistant."
+                            },
+                            {
+                                "role": "user",
+                                "content": "@outputs('Compose_Final_Prompt')"
+                            }
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 512
+                    }
+                }
+            },
+            "Parse_Analysis": {
+                "runAfter": {
+                    "Call_OpenAI_for_Analysis": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "ParseJson",
+                "inputs": {
+                    "content": "@body('Call_OpenAI_for_Analysis')['choices'][0]['message']['content']",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "analysis": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "Add_comment_to_incident_(V3)": {
+                "runAfter": {
+                    "Parse_Analysis": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "ApiConnection",
+                "inputs": {
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                        }
+                    },
+                    "method": "post",
+                    "body": {
+                        "incidentArmId": "@triggerBody()?['object']?['id']",
+                        "message": "<p class=\"editor-paragraph\">@{body('Parse_Analysis')?['analysis']}</p>"
+                    },
+                    "path": "/Incidents/Comment"
+                }
+            }
+        },
+        "outputs": {},
+        "parameters": {
+            "subscriptionId": {
+                "defaultValue": "[YOUR-SUBSCRIPTION-ID]",
+                "type": "String"
+            },
+            "resourceGroupName": {
+                "defaultValue": "[YOUR-RESOURCE-GROUP]",
+                "type": "String"
+            },
+            "workspaceName": {
+                "defaultValue": "[YOUR-WORKSPACE-NAME]",
+                "type": "String"
+            },
+            "workspaceId": {
+                "defaultValue": "[YOUR-WORKSPACE-ID]",
+                "type": "String"
+            },
+            "openAiApiKey": {
+                "defaultValue": "[YOUR-OPENAI-API-KEY]",
+                "type": "String"
+            },
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
+    },
+    "parameters": {
+        "$connections": {
+            "type": "Object",
+            "value": {
+                "azuresentinel": {
+                    "id": "/subscriptions/[YOUR-SUBSCRIPTION-ID]/providers/Microsoft.Web/locations/[YOUR-LOCATION]/managedApis/azuresentinel",
+                    "connectionId": "/subscriptions/[YOUR-SUBSCRIPTION-ID]/resourceGroups/[YOUR-RESOURCE-GROUP]/providers/Microsoft.Web/connections/azuresentinel",
+                    "connectionName": "azuresentinel",
+                    "connectionProperties": {
+                        "authentication": {
+                            "type": "ManagedServiceIdentity"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
