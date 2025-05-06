@@ -57,11 +57,11 @@
                 },
                 "type": "Http",
                 "inputs": {
-                    "uri": "https://api.loganalytics.io/v1/workspaces/@{parameters('workspaceId')}/metadata/tables",
+                    "uri": "https://management.azure.com/subscriptions/@{parameters('subscriptionId')}/resourceGroups/@{parameters('resourceGroupName')}/providers/Microsoft.OperationalInsights/workspaces/@{parameters('workspaceName')}/tables?api-version=2021-12-01-preview",
                     "method": "GET",
                     "authentication": {
                         "type": "ManagedServiceIdentity",
-                        "audience": "https://api.loganalytics.io/"
+                        "audience": "https://management.azure.com/"
                     }
                 }
             },
@@ -73,7 +73,7 @@
                 },
                 "type": "Compose",
                 "inputs": {
-                    "content": "@concat(\n  'Incident ', triggerBody()?['data']['name'], '\n',\n  'Severity: ', triggerBody()?['data']['properties']['severity'], '\n\n',\n  'Available Tables:\\n', body('List_LogAnalytics_Tables')\n)"
+                    "content": "@concat(\n  'Incident: ', coalesce(triggerBody()?['data']?['properties']?['title'], 'Unknown Title'),\n  '\\nID: ', coalesce(triggerBody()?['data']?['name'], 'UnknownID'),\n  '\\nSeverity: ', coalesce(triggerBody()?['data']?['properties']?['severity'], 'UnknownSeverity'),\n  '\\n\\nAvailable Tables:\\n', string(body('List_LogAnalytics_Tables')?['value'])\n)"
                 }
             },
             "Generate_Enrichment_Queries": {
